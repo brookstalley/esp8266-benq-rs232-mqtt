@@ -3,6 +3,10 @@
 #include "Adafruit_MQTT_Client.h"
 #include <ArduinoOTA.h>
 #include <Regexp.h>
+#include <WiFiUdp.h>
+#include <OSCMessage.h>
+#include <OSCBundle.h>
+#include <OSCData.h>
 
 // BEN Q SPECIFICS
 #define serial_command_prepend "\r*"
@@ -10,24 +14,45 @@
 #define serial_baud_rate 115200
 
 // WIFI
-#define WLAN_SSID       "ssid"
-#define WLAN_PASS       "pass"
+//#define WLAN_SSID       "ssid"
+//#define WLAN_PASS       "pass"
+#define WLAN_SSID       "illuminati"
+#define WLAN_PASS       "!!!menow"
 WiFiClient client;
+WiFiUDP Udp;
+
+//COMMANDS
+#define COMMAND_ROOT            "cmnd/projector/"
+#define BENQ_COMMAND_POWER      "POWER"
+#define BENQ_COMMAND_VOLUME     "VOLUME"
+#define BENQ_COMMAND_SOURCE     "SOURCE"
+#define BENQ_COMMAND_LAMP_MODE  "LAMP_MODE"
+#define BENQ_COMMAND_ANY        "COMMAND"
+#define BENQ_COMMAND_MUTE       "MUTE"
 
 //MQTT SERVER
 #define AIO_SERVER      "mqtt-server"
 #define AIO_SERVERPORT  1883
 #define AIO_USERNAME    "mqtt-user"
 #define AIO_KEY         "mqtt-pass"
+#define MQTT_RETRY_FREQ 60000
+#define MQTT_RETRY_MAX  ULONG_MAX
+
+unsigned long mqtt_last_retry = 0;
+unsigned long mqtt_retry_count = 0;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
 Adafruit_MQTT_Publish benq_status_pub = Adafruit_MQTT_Publish(&mqtt, "stat/projector/STATUS");
 Adafruit_MQTT_Publish benq_any_command_pub = Adafruit_MQTT_Publish(&mqtt, "stat/projector/COMMAND");
-Adafruit_MQTT_Subscribe benq_power_sub = Adafruit_MQTT_Subscribe(&mqtt, "cmnd/projector/POWER");
-Adafruit_MQTT_Subscribe benq_volume_sub = Adafruit_MQTT_Subscribe(&mqtt, "cmnd/projector/VOLUME");
-Adafruit_MQTT_Subscribe benq_source_sub = Adafruit_MQTT_Subscribe(&mqtt, "cmnd/projector/SOURCE");
-Adafruit_MQTT_Subscribe benq_lamp_mode_sub = Adafruit_MQTT_Subscribe(&mqtt, "cmnd/projector/LAMP_MODE");
-Adafruit_MQTT_Subscribe benq_any_command_sub = Adafruit_MQTT_Subscribe(&mqtt, "cmnd/projector/COMMAND");
-Adafruit_MQTT_Subscribe benq_mute_sub = Adafruit_MQTT_Subscribe(&mqtt, "cmnd/projector/MUTE");
+Adafruit_MQTT_Subscribe benq_power_sub = Adafruit_MQTT_Subscribe(&mqtt, COMMAND_ROOT BENQ_COMMAND_POWER);
+Adafruit_MQTT_Subscribe benq_volume_sub = Adafruit_MQTT_Subscribe(&mqtt, COMMAND_ROOT BENQ_COMMAND_VOLUME);
+Adafruit_MQTT_Subscribe benq_source_sub = Adafruit_MQTT_Subscribe(&mqtt, COMMAND_ROOT BENQ_COMMAND_SOURCE);
+Adafruit_MQTT_Subscribe benq_lamp_mode_sub = Adafruit_MQTT_Subscribe(&mqtt, COMMAND_ROOT BENQ_COMMAND_LAMP_MODE);
+Adafruit_MQTT_Subscribe benq_any_command_sub = Adafruit_MQTT_Subscribe(&mqtt, COMMAND_ROOT BENQ_COMMAND_ANY);
+Adafruit_MQTT_Subscribe benq_mute_sub = Adafruit_MQTT_Subscribe(&mqtt, COMMAND_ROOT BENQ_COMMAND_MUTE);
+
+//OSC RECIVER
+#define OSC_SERVERPORT  8001
+OSCErrorCode error;
 
 void MQTT_connect() {
   int8_t ret;
@@ -36,22 +61,26 @@ void MQTT_connect() {
   if (mqtt.connected()) {
     return;
   }
+  if ((millis() - mqtt_last_retry) < MQTT_RETRY_FREQ) {
+    return;
+  }
 
   Serial.print("Connecting to MQTT... ");
-
-  uint8_t retries = 3;
-  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
-       Serial.println(mqtt.connectErrorString(ret));
-       Serial.println("Retrying MQTT connection in 5 seconds...");
+  mqtt_last_retry = millis();
+  if ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
+       Serial.print(mqtt.connectErrorString(ret));
+       Serial.println(" Will retry in ...");
        mqtt.disconnect();
-       delay(5000);  // wait 5 seconds
-       retries--;
-       if (retries == 0) {
+       mqtt_retry_count++;
+       if (mqtt_retry_count >= MQTT_RETRY_MAX) {
          // basically die and wait for WDT to reset me
          while (1);
        }
+  } else {
+    Serial.println("MQTT connected!");
+    mqtt_retry_count = 0;
   }
-  Serial.println("MQTT connected!");
+
 }
 
 void setup() {
@@ -72,6 +101,7 @@ void setup() {
   Serial.println("WiFi connected");
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
+  Udp.begin(OSC_SERVERPORT);
 
   ArduinoOTA.onStart([]() {
     String type;
@@ -146,6 +176,26 @@ void loop() {
       benq_publish_status();
     }        
   }
+  // Process OSC commands
+  OSCMessage msg;
+  int size = Udp.parsePacket();
+
+  if (size > 0) {
+    while (size--) {
+      msg.fill(Udp.read());
+    }
+    if (!msg.hasError()) {
+      Serial.print("Routing OSC packet for address: ");
+      char address[50];
+      msg.getAddress((char *)&address, 0, 49);
+      Serial.println(address);
+      msg.route("/cmnd/projector", osc_command);
+    } else {
+      error = msg.getError();
+      Serial.print("error: ");
+      Serial.println(error);
+    }
+  }
   benq_publish_status();
 }
 
@@ -158,7 +208,59 @@ String serial_send_command(String serial_command) {
   return serial_response;
 }
 
+void osc_command(OSCMessage &msg, int addressOffset) {
+  // We know we matched COMMAND_ROOT which includes a trailing slash
+  Serial.print("Got OSC command:");
+  Serial.println(msg.getAddress());
+  char command[24];
+  char firstParam[8] = "";
+  msg.getAddress((char *)&command, addressOffset + 1, sizeof(command));
+  Serial.print("Command: ");
+  Serial.println(command);
+  // We're almost always going to use the first param as a string, just get it once
+  if (msg.size() >= 1) {
+    if (msg.isString(0)) {
+      msg.getString(0, (char *)&firstParam, sizeof(firstParam));
+    } else if (msg.isInt(0)) {
+      int32_t param = msg.getInt(0);
+      itoa(param,firstParam,7);
+    }
+    Serial.print("First param: ");
+    Serial.println(firstParam);
+  }
+
+  if (strcmp(command,BENQ_COMMAND_POWER) == 0) {
+      int32_t value = msg.getInt(0);
+      switch (value) {
+        case 0:
+          benq_send_any_command("pow=off");
+          break;
+        case 1:
+          benq_send_any_command("pow=on");
+          break;       
+        default:
+          Serial.print("Unknown value: ");
+          Serial.println(value); 
+      }
+      
+  }
+  if (strcmp(command,BENQ_COMMAND_VOLUME) == 0)
+      benq_set_volume(atoi((char *)firstParam));
+  if (strcmp(command,BENQ_COMMAND_SOURCE) == 0)
+      benq_send_any_command("sour="+String((char *)firstParam));
+  if (strcmp(command,BENQ_COMMAND_LAMP_MODE) == 0)
+      benq_send_any_command("lampm="+String((char *)firstParam));   
+  if (strcmp(command,BENQ_COMMAND_ANY) == 0)
+      benq_send_any_command(String((char *)firstParam));      
+  if (strcmp(command,BENQ_COMMAND_MUTE) == 0)
+      benq_send_any_command("mute="+String((char *)firstParam));     
+
+  benq_publish_status();
+}
+
 String benq_send_any_command(String command) {
+  Serial.print("Sending benq command: ");
+  Serial.println(command);
   String response = serial_send_command(command);
   String status_response = "{\"COMMAND\":\"" + command + "\",\"RESPONSE\":\"" + response + "\"}";
   benq_any_command_pub.publish(status_response.c_str());
